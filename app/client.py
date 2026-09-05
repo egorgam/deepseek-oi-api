@@ -41,10 +41,48 @@ from app.models import (
 PROJECT_ROOT = Path(__file__).parent.parent.resolve()
 BASE_URL = "https://chat.deepseek.com"
 
+
+def _is_busy_message(message: str, finish_reason: str = "") -> bool:
+    text = f"{message} {finish_reason}".lower()
+    return (
+        finish_reason == "rate_limit_reached"
+        or "server busy" in text
+        or "try again later" in text
+        or "frequent" in text
+        or "rate limit" in text
+    )
+
+
+def _upstream_search_error(event_data: Dict[str, Any]) -> HTTPException:
+    err_content = event_data.get("content", "DeepSeek upstream error")
+    finish_r = str(event_data.get("finish_reason") or "")
+    if _is_busy_message(str(err_content), finish_r):
+        return HTTPException(
+            status_code=429,
+            detail={"error": {"message": err_content, "type": "rate_limit_error", "param": None, "code": "rate_limit_exceeded"}}
+        )
+    return HTTPException(
+        status_code=400,
+        detail={"error": {"message": err_content, "type": "invalid_request_error", "code": finish_r or "upstream_error"}}
+    )
+
+
+def _is_busy_http_error(exc: HTTPException) -> bool:
+    if exc.status_code == 429:
+        return True
+    detail = exc.detail
+    if isinstance(detail, dict):
+        message = str((detail.get("error") or {}).get("message") or "")
+        return _is_busy_message(message)
+    return _is_busy_message(str(detail))
+
 class DeepSeekClient:
     def __init__(self):
         self._user_token: Optional[str] = None
         self._cookies: Dict[str, str] = {}
+        # Harness web_search fires up to 4 queries in parallel; DeepSeek Web
+        # answers that with "Server busy" unless they are queued.
+        self._search_lock = asyncio.Lock()
         self.load_credentials()
 
     def load_credentials(self):
@@ -414,6 +452,21 @@ class DeepSeekClient:
                 detail={"error": {"message": "Search query is empty.", "type": "invalid_request_error", "code": "missing_query"}}
             )
 
+        async with self._search_lock:
+            last_error: Optional[HTTPException] = None
+            for attempt in range(4):
+                try:
+                    return await self._execute_web_search_once(prompt, model_name)
+                except HTTPException as exc:
+                    if not _is_busy_http_error(exc) or attempt == 3:
+                        raise
+                    last_error = exc
+                    delay = 2 * (2 ** attempt)
+                    print(f"[search] busy, retry {attempt + 1}/3 in {delay}s: {exc.detail}")
+                    await asyncio.sleep(delay)
+            raise last_error or HTTPException(status_code=429, detail={"error": {"message": "Server busy", "type": "rate_limit_error", "code": "rate_limit_exceeded"}})
+
+    async def _execute_web_search_once(self, prompt: str, model_name: str) -> Dict[str, Any]:
         async with httpx.AsyncClient(timeout=180.0, cookies=self._cookies) as http_client:
             chat_session_id = await self.create_chat_session(http_client)
             pow_header = await self.solve_pow(http_client, target_path="/api/v0/chat/completion")
@@ -465,18 +518,19 @@ class DeepSeekClient:
                         except Exception:
                             continue
                         if event_data.get("type") == "error":
-                            err_content = event_data.get("content", "DeepSeek upstream error")
-                            raise HTTPException(
-                                status_code=400,
-                                detail={"error": {"message": err_content, "type": "invalid_request_error", "code": "upstream_error"}}
-                            )
+                            raise _upstream_search_error(event_data)
                         apply_sse_event(state, event_data)
                 leftover = buffer.strip()
                 if leftover.startswith("data:"):
                     data_str = leftover[5:].strip()
                     if data_str:
                         try:
-                            apply_sse_event(state, json.loads(data_str))
+                            event_data = json.loads(data_str)
+                            if event_data.get("type") == "error":
+                                raise _upstream_search_error(event_data)
+                            apply_sse_event(state, event_data)
+                        except HTTPException:
+                            raise
                         except Exception:
                             pass
 
