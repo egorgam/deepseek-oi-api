@@ -15,6 +15,11 @@ from app.models import (
     ModelItem
 )
 from app.client import DeepSeekClient
+from app.search import (
+    anthropic_search_message,
+    extract_search_query,
+    request_wants_web_search,
+)
 
 app = FastAPI(
     title="DeepSeek OpenAI-Compatible API Wrapper",
@@ -257,3 +262,64 @@ async def chat_completions(
             tool_choice=request.tool_choice
         )
         return response_data
+
+
+@app.post("/anthropic/v1/messages")
+@app.post("/v1/messages")
+async def anthropic_messages(request: Request, authorization: Optional[str] = Header(None)):
+    """
+    Anthropic Messages shim used by DeepSeek Harness web_search.
+
+    The harness does not reuse /v1/chat/completions for search: it POSTs here with
+    the native web_search_20250305 server tool and expects web_search_tool_result blocks.
+    """
+    verify_authorization(authorization)
+    if not ds_client._user_token:
+        ds_client.load_credentials()
+        if not ds_client._user_token:
+            return openai_error_response(
+                message="DeepSeek user token not found. Please run login.py or provide DEEPSEEK_TOKEN.",
+                error_type="authentication_error",
+                code="missing_credentials",
+                status_code=status.HTTP_401_UNAUTHORIZED
+            )
+
+    try:
+        body = await request.json()
+    except Exception:
+        return openai_error_response(
+            message="Request body must be valid JSON.",
+            error_type="invalid_request_error",
+            code="invalid_json",
+            status_code=status.HTTP_400_BAD_REQUEST
+        )
+    if not isinstance(body, dict):
+        return openai_error_response(
+            message="Request body must be a JSON object.",
+            error_type="invalid_request_error",
+            code="invalid_json",
+            status_code=status.HTTP_400_BAD_REQUEST
+        )
+
+    model_name = str(body.get("model") or "deepseek-v4-flash")
+    if not request_wants_web_search(body):
+        return openai_error_response(
+            message="This endpoint implements DeepSeek Harness web_search only. Send tools=[{type: web_search_20250305, name: web_search}].",
+            error_type="invalid_request_error",
+            param="tools",
+            code="missing_web_search_tool",
+            status_code=status.HTTP_400_BAD_REQUEST
+        )
+
+    query = extract_search_query(body)
+    if not query:
+        return openai_error_response(
+            message="Search query is empty.",
+            error_type="invalid_request_error",
+            param="messages",
+            code="missing_query",
+            status_code=status.HTTP_400_BAD_REQUEST
+        )
+
+    result = await ds_client.execute_web_search(query, model_name=model_name)
+    return anthropic_search_message(model_name, result["sources"], result.get("text") or "")

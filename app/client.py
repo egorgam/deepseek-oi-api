@@ -17,6 +17,11 @@ from app.tool_parser import (
     format_assistant_tool_calls,
     get_safe_streamable_text
 )
+from app.search import (
+    apply_sse_event,
+    collect_search_sources,
+    fragment_text,
+)
 from app.models import (
     ChatMessage,
     ChatCompletionResponse,
@@ -385,7 +390,7 @@ class DeepSeekClient:
                 "prompt": prompt,
                 "ref_file_ids": ref_file_ids,
                 "thinking_enabled": thinking_enabled,
-                "search_enabled": False  # Hardcoded to False per spec
+                "search_enabled": search_enabled,
             }
 
             headers = self.get_headers({"x-ds-pow-response": pow_header})
@@ -399,6 +404,92 @@ class DeepSeekClient:
                 return await self._collect_response(
                     http_client, completion_url, headers, payload, model_name, request_id, created_ts, prompt
                 )
+
+    async def execute_web_search(self, query: str, model_name: str = "deepseek-v4-flash") -> Dict[str, Any]:
+        """Run DeepSeek Web with native search and return reconstructed sources + text."""
+        prompt = query.strip()
+        if not prompt:
+            raise HTTPException(
+                status_code=400,
+                detail={"error": {"message": "Search query is empty.", "type": "invalid_request_error", "code": "missing_query"}}
+            )
+
+        async with httpx.AsyncClient(timeout=180.0, cookies=self._cookies) as http_client:
+            chat_session_id = await self.create_chat_session(http_client)
+            pow_header = await self.solve_pow(http_client, target_path="/api/v0/chat/completion")
+            payload = {
+                "chat_session_id": chat_session_id,
+                "parent_message_id": None,
+                "model_type": "default",
+                "prompt": prompt,
+                "ref_file_ids": [],
+                "thinking_enabled": False,
+                "search_enabled": True,
+            }
+            headers = self.get_headers({"x-ds-pow-response": pow_header})
+            state: Dict[str, Any] = {"fragments": [], "extras": {}}
+
+            async with http_client.stream(
+                "POST",
+                f"{BASE_URL}/api/v0/chat/completion",
+                headers=headers,
+                json=payload,
+            ) as response:
+                if response.status_code != 200:
+                    err_text = await response.aread()
+                    raise HTTPException(
+                        status_code=502,
+                        detail={
+                            "error": {
+                                "message": f"DeepSeek search upstream error {response.status_code}: {err_text.decode('utf-8', errors='replace')}",
+                                "type": "api_error",
+                                "code": "upstream_error",
+                            }
+                        },
+                    )
+
+                buffer = ""
+                async for chunk_bytes in response.aiter_bytes():
+                    buffer += chunk_bytes.decode("utf-8", errors="replace")
+                    lines = buffer.split("\n")
+                    buffer = lines.pop()
+                    for line in lines:
+                        line = line.strip()
+                        if not line.startswith("data:"):
+                            continue
+                        data_str = line[5:].strip()
+                        if not data_str:
+                            continue
+                        try:
+                            event_data = json.loads(data_str)
+                        except Exception:
+                            continue
+                        if event_data.get("type") == "error":
+                            err_content = event_data.get("content", "DeepSeek upstream error")
+                            raise HTTPException(
+                                status_code=400,
+                                detail={"error": {"message": err_content, "type": "invalid_request_error", "code": "upstream_error"}}
+                            )
+                        apply_sse_event(state, event_data)
+                leftover = buffer.strip()
+                if leftover.startswith("data:"):
+                    data_str = leftover[5:].strip()
+                    if data_str:
+                        try:
+                            apply_sse_event(state, json.loads(data_str))
+                        except Exception:
+                            pass
+
+        sources = collect_search_sources(state)
+        text = fragment_text(state)
+        print(f"[search] query={prompt!r} sources={len(sources)} text_chars={len(text)}")
+        return {
+            "model": model_name,
+            "query": prompt,
+            "sources": sources,
+            "text": text,
+            "fragments": state.get("fragments") or [],
+        }
 
     async def _stream_generator(
         self,
