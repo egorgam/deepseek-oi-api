@@ -1,0 +1,19 @@
+[project]
+name = "deepseek-oi-api"
+version = "1.0.0"
+description = "OpenAI-compatible API wrapper for DeepSeek Web"
+requires-python = ">=3.10"
+dependencies = [
+    "fastapi==0.141.1",
+    "uvicorn[standard]==0.52.3",
+    "httpx==0.28.1",
+    "pydantic==2.13.4",
+    "python-multipart==0.0.32",
+    "pycryptodome==3.23.0",
+]
+
+[project.optional-dependencies]
+login = [
+    "camoufox[geoip]==0.5.4",
+    "playwright==1.60.0",
+]
