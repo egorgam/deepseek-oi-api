@@ -18,6 +18,7 @@ from app.client import DeepSeekClient
 from app.search import (
     anthropic_search_message,
     extract_search_query,
+    local_web_search,
     request_wants_web_search,
 )
 
@@ -270,19 +271,9 @@ async def anthropic_messages(request: Request, authorization: Optional[str] = He
     """
     Anthropic Messages shim used by DeepSeek Harness web_search.
 
-    The harness does not reuse /v1/chat/completions for search: it POSTs here with
-    the native web_search_20250305 server tool and expects web_search_tool_result blocks.
+    Search runs on this host (DuckDuckGo, Bing fallback). DeepSeek is not called.
     """
     verify_authorization(authorization)
-    if not ds_client._user_token:
-        ds_client.load_credentials()
-        if not ds_client._user_token:
-            return openai_error_response(
-                message="DeepSeek user token not found. Please run login.py or provide DEEPSEEK_TOKEN.",
-                error_type="authentication_error",
-                code="missing_credentials",
-                status_code=status.HTTP_401_UNAUTHORIZED
-            )
 
     try:
         body = await request.json()
@@ -321,5 +312,14 @@ async def anthropic_messages(request: Request, authorization: Optional[str] = He
             status_code=status.HTTP_400_BAD_REQUEST
         )
 
-    result = await ds_client.execute_web_search(query, model_name=model_name)
-    return anthropic_search_message(model_name, result["sources"], result.get("text") or "")
+    try:
+        sources = await local_web_search(query)
+    except Exception as exc:
+        return openai_error_response(
+            message=f"Local web search failed: {exc}",
+            error_type="api_error",
+            code="search_failed",
+            status_code=status.HTTP_502_BAD_GATEWAY
+        )
+    print(f"[search] local query={query!r} sources={len(sources)}")
+    return anthropic_search_message(model_name, sources)

@@ -1,13 +1,19 @@
-"""Parse DeepSeek Web SSE fragments into Anthropic web_search result blocks."""
+"""Local web search for the DeepSeek Harness Anthropic Messages shim."""
 from __future__ import annotations
 
+import html
 import re
-from datetime import datetime, timezone
-from typing import Any, Dict, Iterable, List, Optional, Tuple
-from urllib.parse import urlparse
+from html.parser import HTMLParser
+from typing import Any, Dict, List
+from urllib.parse import parse_qs, unquote, urljoin, urlparse
 
-URL_RE = re.compile(r"https?://[^\s\]\)<>\"']+", re.IGNORECASE)
+import httpx
+
 SEARCH_QUERY_PREFIX = "Perform a web search for the query: "
+USER_AGENT = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
+)
 
 
 def extract_search_query(body: Dict[str, Any]) -> str:
@@ -33,7 +39,7 @@ def extract_search_query(body: Dict[str, Any]) -> str:
 
 
 def request_wants_web_search(body: Dict[str, Any]) -> bool:
-    """True when the Messages request includes DeepSeek's native search tool."""
+    """True when the Messages request includes the harness web_search tool."""
     for tool in body.get("tools") or []:
         if not isinstance(tool, dict):
             continue
@@ -42,77 +48,6 @@ def request_wants_web_search(body: Dict[str, Any]) -> bool:
         if name == "web_search" or tool_type.startswith("web_search"):
             return True
     return False
-
-
-def apply_sse_event(state: Dict[str, Any], event: Dict[str, Any]) -> None:
-    """Fold one DeepSeek JSON-patch SSE event into reconstructed fragments."""
-    if isinstance(event, list):
-        for item in event:
-            apply_sse_event(state, item)
-        return
-    if not isinstance(event, dict):
-        return
-
-    value = event.get("v")
-    path = event.get("p")
-    op = event.get("o")
-
-    if op == "BATCH" and isinstance(value, list):
-        for item in value:
-            if isinstance(item, dict):
-                nested = item if "p" in item or "v" in item else {"p": path, "o": item.get("o"), "v": item.get("v")}
-                apply_sse_event(state, nested)
-        return
-
-    if path is None and isinstance(value, dict) and isinstance(value.get("response"), dict):
-        _ingest_response(state, value["response"])
-        return
-
-    if path is None and isinstance(value, str):
-        fragments = state.setdefault("fragments", [])
-        if fragments and isinstance(fragments[-1], dict):
-            fragments[-1]["content"] = (fragments[-1].get("content") or "") + value
-        return
-
-    _apply_path(state, path, op, value)
-
-
-def collect_search_sources(state: Dict[str, Any]) -> List[Dict[str, str]]:
-    """Deduped url/title/snippet records from fragments, extras, and prose."""
-    found: List[Dict[str, str]] = []
-    seen: set[str] = set()
-
-    def add(url: str, title: str = "", snippet: str = "", page_age: str = "") -> None:
-        normalized = _normalize_url(url)
-        if not normalized or normalized in seen:
-            return
-        seen.add(normalized)
-        item: Dict[str, str] = {"url": normalized}
-        if title:
-            item["title"] = title
-        if snippet:
-            item["snippet"] = snippet[:500]
-        if page_age:
-            item["page_age"] = page_age
-        found.append(item)
-
-    extras = state.get("extras") or {}
-    fragments = state.get("fragments") or []
-    _harvest_obj(extras, add)
-    for fragment in fragments:
-        if isinstance(fragment, dict):
-            _harvest_obj(fragment, add)
-
-    if not found:
-        for fragment in fragments:
-            if not isinstance(fragment, dict):
-                continue
-            frag_type = str(fragment.get("type") or "")
-            if frag_type in ("SEARCH", "RESPONSE", "SEARCH_RESULT"):
-                for url in URL_RE.findall(str(fragment.get("content") or "")):
-                    add(url)
-
-    return found
 
 
 def anthropic_search_message(model: str, sources: List[Dict[str, str]], text: str = "") -> Dict[str, Any]:
@@ -154,131 +89,152 @@ def anthropic_search_message(model: str, sources: List[Dict[str, str]], text: st
     }
 
 
-def fragment_text(state: Dict[str, Any], types: Iterable[str] = ("RESPONSE", "SEARCH")) -> str:
-    allowed = set(types)
-    parts: List[str] = []
-    for fragment in state.get("fragments") or []:
-        if isinstance(fragment, dict) and fragment.get("type") in allowed:
-            content = fragment.get("content")
-            if content:
-                parts.append(str(content))
-    return "".join(parts)
+async def local_web_search(query: str, max_results: int = 8) -> List[Dict[str, str]]:
+    """Search the web from this host. Does not call DeepSeek."""
+    q = query.strip()
+    if not q:
+        return []
+    async with httpx.AsyncClient(timeout=20.0, follow_redirects=True, headers={"User-Agent": USER_AGENT}) as client:
+        sources = await _search_duckduckgo(client, q)
+        if not sources:
+            sources = await _search_bing(client, q)
+    return sources[:max_results]
 
 
-def _ingest_response(state: Dict[str, Any], response: Dict[str, Any]) -> None:
-    fragments = response.get("fragments")
-    if isinstance(fragments, list):
-        state["fragments"] = [dict(item) if isinstance(item, dict) else item for item in fragments]
-    extras = state.setdefault("extras", {})
-    for key, value in response.items():
-        if key == "fragments":
-            continue
-        lowered = key.lower()
-        if "search" in lowered or "cite" in lowered or key in ("links", "sources", "results"):
-            extras[key] = value
+async def _search_duckduckgo(client: httpx.AsyncClient, query: str) -> List[Dict[str, str]]:
+    response = await client.post(
+        "https://html.duckduckgo.com/html/",
+        data={"q": query},
+        headers={"Referer": "https://html.duckduckgo.com/html/"},
+    )
+    response.raise_for_status()
+    parser = _DuckDuckGoParser()
+    parser.feed(response.text)
+    return parser.results
 
 
-def _apply_path(state: Dict[str, Any], path: Optional[str], op: Optional[str], value: Any) -> None:
-    if not path:
-        return
-    local = path[9:] if path.startswith("response/") else path
-    fragments: List[Any] = state.setdefault("fragments", [])
-    extras: Dict[str, Any] = state.setdefault("extras", {})
-
-    if local == "fragments" and op == "APPEND":
-        items = value if isinstance(value, list) else [value]
-        for item in items:
-            fragments.append(dict(item) if isinstance(item, dict) else item)
-        return
-
-    match = re.fullmatch(r"fragments/(-?\d+)(?:/(.+))?", local)
-    if match:
-        index = int(match.group(1))
-        if index == -1:
-            index = len(fragments) - 1
-        field = match.group(2)
-        if 0 <= index < len(fragments):
-            if field is None:
-                if op == "SET" and isinstance(value, dict):
-                    fragments[index] = dict(value)
-                elif op == "APPEND" and isinstance(value, dict):
-                    current = fragments[index]
-                    if isinstance(current, dict):
-                        current.update(value)
-                    else:
-                        fragments[index] = dict(value)
-                return
-            if isinstance(fragments[index], dict):
-                append_text = field == "content" and isinstance(value, str) and op in (None, "APPEND")
-                if op == "APPEND" or append_text:
-                    if isinstance(value, str):
-                        fragments[index][field] = (fragments[index].get(field) or "") + value
-                    elif isinstance(value, list):
-                        existing = fragments[index].get(field)
-                        if isinstance(existing, list):
-                            existing.extend(value)
-                        else:
-                            fragments[index][field] = list(value)
-                    else:
-                        fragments[index][field] = value
-                else:
-                    fragments[index][field] = value
-        return
-
-    if "search" in local.lower() or "cite" in local.lower():
-        extras[local] = value
+async def _search_bing(client: httpx.AsyncClient, query: str) -> List[Dict[str, str]]:
+    response = await client.get("https://www.bing.com/search", params={"q": query})
+    response.raise_for_status()
+    parser = _BingParser()
+    parser.feed(response.text)
+    return parser.results
 
 
-def _harvest_obj(obj: Any, add, depth: int = 0) -> None:
-    if depth > 8:
-        return
-    if isinstance(obj, list):
-        for item in obj:
-            _harvest_obj(item, add, depth + 1)
-        return
-    if not isinstance(obj, dict):
-        return
+class _DuckDuckGoParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__()
+        self.results: List[Dict[str, str]] = []
+        self._mode = ""
+        self._buf: List[str] = []
 
-    url = obj.get("url") or obj.get("link") or obj.get("href")
-    if isinstance(url, str) and url.startswith(("http://", "https://")):
-        title = _first_str(obj, ("title", "name", "headline"))
-        snippet = _first_str(obj, ("snippet", "cite", "cited_text", "description", "summary"))
-        page_age = _first_str(obj, ("page_age", "date", "published")) or _epoch_date(
-            obj.get("published_at") or obj.get("publishedAt")
-        )
-        add(url, title, snippet, page_age)
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        cls = _class_attr(attrs)
+        if tag == "a" and "result__a" in cls:
+            href = _attr(attrs, "href")
+            url = _unwrap_ddg_url(href)
+            if url:
+                self.results.append({"url": url, "title": "", "snippet": ""})
+                self._mode = "title"
+                self._buf = []
+        elif tag == "a" and "result__snippet" in cls and self.results:
+            self._mode = "snippet"
+            self._buf = []
 
-    for key, value in obj.items():
-        if key in ("content",) and isinstance(value, str):
-            continue
-        _harvest_obj(value, add, depth + 1)
+    def handle_endtag(self, tag: str) -> None:
+        if tag != "a" or not self._mode or not self.results:
+            return
+        text = _clean_text("".join(self._buf))
+        if self._mode == "title":
+            self.results[-1]["title"] = text
+        elif self._mode == "snippet":
+            self.results[-1]["snippet"] = text[:500]
+        self._mode = ""
+
+    def handle_data(self, data: str) -> None:
+        if self._mode:
+            self._buf.append(data)
 
 
-def _first_str(obj: Dict[str, Any], keys: Tuple[str, ...]) -> str:
-    for key in keys:
-        value = obj.get(key)
-        if isinstance(value, str) and value.strip():
-            return value.strip()
+class _BingParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__()
+        self.results: List[Dict[str, str]] = []
+        self._in_algo = False
+        self._mode = ""
+        self._buf: List[str] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        cls = _class_attr(attrs)
+        if tag == "li" and "b_algo" in cls:
+            self._in_algo = True
+        elif self._in_algo and tag == "h2":
+            self._mode = "await_title"
+        elif self._in_algo and tag == "a" and self._mode == "await_title":
+            href = _normalize_http_url(_attr(attrs, "href"))
+            if href:
+                self.results.append({"url": href, "title": "", "snippet": ""})
+                self._mode = "title"
+                self._buf = []
+        elif self._in_algo and tag == "p" and self.results and not self.results[-1].get("snippet"):
+            self._mode = "snippet"
+            self._buf = []
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag == "li":
+            self._in_algo = False
+            self._mode = ""
+            return
+        if not self.results:
+            return
+        text = _clean_text("".join(self._buf))
+        if tag == "a" and self._mode == "title":
+            self.results[-1]["title"] = text
+            self._mode = ""
+            self._buf = []
+        elif tag == "p" and self._mode == "snippet":
+            self.results[-1]["snippet"] = text[:500]
+            self._mode = ""
+            self._buf = []
+
+    def handle_data(self, data: str) -> None:
+        if self._mode in ("title", "snippet"):
+            self._buf.append(data)
+
+
+def _attr(attrs: list[tuple[str, str | None]], name: str) -> str:
+    for key, value in attrs:
+        if key == name and value:
+            return value
     return ""
 
 
-def _epoch_date(value: Any) -> str:
-    if isinstance(value, str) and value.strip():
-        return value.strip()
-    if isinstance(value, (int, float)) and value > 0:
-        try:
-            return datetime.fromtimestamp(float(value), tz=timezone.utc).date().isoformat()
-        except (OverflowError, OSError, ValueError):
-            return ""
-    return ""
+def _class_attr(attrs: list[tuple[str, str | None]]) -> str:
+    return _attr(attrs, "class")
 
 
-def _normalize_url(url: str) -> str:
-    cleaned = url.rstrip(").,;]}>")
-    try:
-        parsed = urlparse(cleaned)
-    except Exception:
+def _unwrap_ddg_url(href: str) -> str:
+    if not href:
         return ""
+    absolute = urljoin("https://html.duckduckgo.com", href)
+    parsed = urlparse(absolute)
+    if parsed.path == "/l/" or parsed.netloc.endswith("duckduckgo.com") and "uddg" in parsed.query:
+        uddg = parse_qs(parsed.query).get("uddg", [""])[0]
+        if uddg:
+            return _normalize_http_url(unquote(uddg))
+    return _normalize_http_url(absolute)
+
+
+def _normalize_http_url(url: str) -> str:
+    cleaned = html.unescape((url or "").strip()).rstrip(").,;]}>")
+    parsed = urlparse(cleaned)
     if parsed.scheme not in ("http", "https") or not parsed.netloc:
         return ""
+    host = parsed.netloc.lower()
+    if "duckduckgo.com" in host or "bing.com" in host or "microsoft.com" in host:
+        return ""
     return cleaned
+
+
+def _clean_text(value: str) -> str:
+    return re.sub(r"\s+", " ", html.unescape(value)).strip()
